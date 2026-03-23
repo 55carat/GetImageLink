@@ -27,21 +27,35 @@ class UpdateWorker(QThread):
         try:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-            process = subprocess.Popen(
-                ["git", "pull"],
-                cwd=os.getcwd(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                startupinfo=startupinfo,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-
-            process.communicate()
+    
+            commands = [
+                ["git", "fetch", "--all"],
+                ["git", "reset", "--hard", "origin/main"],
+                ["git", "clean", "-fd"]
+            ]
+    
+            for cmd in commands:
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=os.getcwd(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+    
+                try:
+                    process.communicate(timeout=15)  # ⏱️ prevent hang
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    self.finished.emit(False)
+                    return
+    
             self.finished.emit(True)
-
-        except:
+    
+        except Exception as e:
+            print("Error:", e)
             self.finished.emit(False)
 
 
