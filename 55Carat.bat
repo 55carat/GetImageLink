@@ -1,3 +1,3 @@
 @echo off
-start "" pythonw.exe "55Carat.py"
+start "" pythonw.exe "Updater.py"
 exit
