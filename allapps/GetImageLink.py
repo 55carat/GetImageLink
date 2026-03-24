@@ -496,7 +496,7 @@ class ExcelProcessThread(QThread):
             # Hide the file explicitly as requested
             self.status_signal.emit("Hiding Excel file...")
             try:
-                subprocess.run(['attrib', '+h', '+s', '+r', abs_excel_path], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                subprocess.run(['attrib', '+h', '+s', abs_excel_path], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
             except Exception as e:
                 self.status_signal.emit(f"Warning: Could not hide file - {e}")
 
@@ -789,7 +789,7 @@ class ExcelProcessThread(QThread):
             self.status_signal.emit("Saving and unhiding Excel file...")
             if wb:
                 try:
-                    subprocess.run(['attrib', '-h', '-s', '-r', os.path.abspath(self.excel_path)], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    subprocess.run(['attrib', '-h', '-s', os.path.abspath(self.excel_path)], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
                 except Exception as e:
                     self.status_signal.emit(f"Warning: Could not unhide file - {e}")
 
@@ -1312,7 +1312,7 @@ class ExcelProcessThread(QThread):
             # Hide the file explicitly as requested
             self.status_signal.emit("Hiding Excel file...")
             try:
-                subprocess.run(['attrib', '+h', '+s', '+r', abs_excel_path], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                subprocess.run(['attrib', '+h', '+s', abs_excel_path], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
             except Exception as e:
                 self.status_signal.emit(f"Warning: Could not hide file - {e}")
 
@@ -1605,7 +1605,7 @@ class ExcelProcessThread(QThread):
             self.status_signal.emit("Saving and unhiding Excel file...")
             if wb:
                 try:
-                    subprocess.run(['attrib', '-h', '-s', '-r', os.path.abspath(self.excel_path)], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                    subprocess.run(['attrib', '-h', '-s', os.path.abspath(self.excel_path)], check=True, creationflags=subprocess.CREATE_NO_WINDOW)
                 except Exception as e:
                     self.status_signal.emit(f"Warning: Could not unhide file - {e}")
 
