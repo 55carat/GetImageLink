@@ -63,7 +63,7 @@ class ChromeBrowserController:
         
         raise FileNotFoundError("Chrome executable not found. Please install Google Chrome.")
     
-    def launch_chrome(self):
+    def launch_chrome(self, initial_url=None):
         """Launch Chrome with remote debugging enabled (or skip if already running)"""
         # Check if Chrome is already running on this port
         if self.is_port_in_use(self.port):
@@ -80,6 +80,10 @@ class ChromeBrowserController:
             "--no-first-run",
             "--no-default-browser-check",
         ]
+
+        # If an initial URL is provided, add it so Chrome opens that page on launch
+        if initial_url:
+            chrome_args.append(initial_url)
         
         print(f"Launching Chrome on port {self.port}...")
         print(f"User data directory: {self.user_data_dir}")
@@ -382,9 +386,10 @@ class ChromeLaunchThread(QThread):
     notification_signal = Signal(str, str)
     finished_signal = Signal(bool, bool)
 
-    def __init__(self, controller):
+    def __init__(self, controller, region_domain=None):
         super().__init__()
         self.controller = controller
+        self.region_domain = region_domain
 
     def run(self):
         try:
@@ -394,7 +399,18 @@ class ChromeLaunchThread(QThread):
                 self.notification_signal.emit("Already Opened", f"Browser already running...")
             else:
                 self.status_signal.emit("Launching Chrome...")
-                self.controller.launch_chrome()
+                # If region_domain provided, build sellercentral URL and open it on launch so user can login
+                if self.region_domain:
+                    try:
+                        d = self.region_domain.replace('www.', '')
+                        seller_host = f"sellercentral.{d}"
+                        seller_url = (f"https://{seller_host}/")
+                    except Exception:
+                        seller_url = None
+                else:
+                    seller_url = None
+
+                self.controller.launch_chrome(initial_url=seller_url)
                 
             if self.controller.connect_playwright():
                 self.status_signal.emit("Browser connected.")
@@ -412,6 +428,7 @@ class ExcelProcessThread(QThread):
     notification_signal = Signal(str, str)
     finished_signal = Signal(bool)
     retry_save_signal = Signal()
+    login_request_signal = Signal(str, str)
 
     def __init__(self, controller, excel_path, domain="www.amazon.com", batch_size=5):
         super().__init__()
@@ -437,6 +454,7 @@ class ExcelProcessThread(QThread):
             "www.amazon.sg"
         ]
         self.batch_size = batch_size
+        self.user_logged_in = False
 
 
     def run(self):
@@ -454,6 +472,24 @@ class ExcelProcessThread(QThread):
             # Reconnect Playwright exclusively in this thread
             if not self.controller.connect_playwright():
                 self.notification_signal.emit("Error", "Failed to connect to browser!")
+                self.finished_signal.emit(False)
+                return
+            # Ask user to login to Seller Central before proceeding
+            try:
+                self.notification_signal.emit("Please login", "Please login to Seller Central in the opened browser to continue.")
+                # This will trigger the main UI to show a blocking dialog; the connection uses BlockingQueuedConnection
+                self.login_request_signal.emit("Please login", "Please login to Seller Central in the opened browser and click OK to continue.")
+            except Exception:
+                pass
+
+            # Wait until the main UI confirms the user clicked OK (i.e., user logged in)
+            wait_start = time.time()
+            while not self.user_logged_in and not self.stop_requested:
+                time.sleep(0.2)
+            if self.stop_requested:
+                if excel:
+                    try: excel.Quit()
+                    except: pass
                 self.finished_signal.emit(False)
                 return
                 
@@ -502,180 +538,254 @@ class ExcelProcessThread(QThread):
 
             self.status_signal.emit("Reading Excel file...")
 
-            rows_to_process = []
             max_row = sheet.UsedRange.Rows.Count
-            for row_idx in range(2, max_row + 1):
-                status = sheet.Cells(row_idx, 15).Value
-                if status and str(status).strip().lower() == "yes":
-                    continue
-                    
-                parent_sku = sheet.Cells(row_idx, 1).Value
-                asin = sheet.Cells(row_idx, 3).Value
-                
-                if parent_sku and asin:
-                    rows_to_process.append({
-                        "row_idx": row_idx,
-                        "sku": parent_sku,
-                        "asin": asin,
-                    })
-
-            # Process rows with up to `batch_size` concurrent tabs managed by this thread.
+            current_row = 2
             batch_size = self.batch_size
 
-            pending = list(rows_to_process)
-            opened = []  # currently processing items
-            available_pages = []  # pages that can be reused
-            
-            while pending or opened:
-                if self.stop_requested:
-                    self.status_signal.emit("Stop requested. Cleaning up...")
-                    break
-                
-                # Open new tabs or reuse existing up to batch_size
-                while pending and len(opened) < batch_size:
-                    item = pending.pop(0)
-                    
-                    # Reuse page if available, otherwise create a new one. Keep region fixed.
-                    if available_pages:
-                        page, last_successful_domain = available_pages.pop()
-                        current_domain = last_successful_domain
-                        try: page.evaluate("document.body.innerHTML = '';")
-                        except: pass
-                    else:
-                        page = self.controller.context.new_page()
-                        current_domain = self.domain
+            overall_stop = False
 
-                    opened.append({
-                        "page": page,
-                        "row_idx": item['row_idx'],
-                        "sku": item['sku'],
-                        "asin": item['asin'],
-                        "current_domain": current_domain,
-                        "stage": "navigating",
-                        "next_action_time": 0,
-                        "start_t": 0,
-                        "row_start_t": time.time(),
-                        "reload1_done": False,
-                        "reload2_done": False
-                    })
-
-                tab_was_freed = False
-                current_time = time.time()
-
-                for entry in list(opened):
-                    page = entry["page"]
-                    
-                    # 1. Check if user manually closed it
+            # Read in chunks of 100 rows to avoid large memory/processing stalls
+            while current_row <= max_row and not self.stop_requested:
+                end_row = min(current_row + 99, max_row)
+                rows_to_process = []
+                for row_idx in range(current_row, end_row + 1):
                     try:
-                        if page.is_closed():
-                            if entry in opened:
-                                opened.remove(entry)
-                                tab_was_freed = True
-                            continue
+                        status = sheet.Cells(row_idx, 15).Value
                     except Exception:
-                        if entry in opened:
-                            try: opened.remove(entry)
-                            except: pass
-                            tab_was_freed = True
+                        status = None
+                    if status and str(status).strip().lower() == "yes":
                         continue
 
-                    stage = entry.get("stage")
+                    sku = sheet.Cells(row_idx, 2).Value
+                    asin = sheet.Cells(row_idx, 3).Value
 
-                    if stage != "delaying_next_row":
-                        if current_time - entry.get("row_start_t", current_time) > 30:
-                            self.status_signal.emit(f"Row {entry['row_idx']} (ASIN={entry['asin']}) exceeded 30s. Skipping.")
-                            if entry in opened:
-                                try: opened.remove(entry)
-                                except: pass
-                                tab_was_freed = True
-                            available_pages.append((page, entry["current_domain"]))
-                            try: page.evaluate("document.body.innerHTML = '<h2>Skipped - took more than 30s!</h2>';")
+                    if sku and asin:
+                        rows_to_process.append({
+                            "row_idx": row_idx,
+                            "sku": sku,
+                            "asin": asin,
+                        })
+
+                # If nothing to process in this chunk, move to next
+                if not rows_to_process:
+                    current_row = end_row + 1
+                    # refresh max_row in case sheet was modified
+                    try:
+                        max_row = sheet.UsedRange.Rows.Count
+                    except Exception:
+                        pass
+                    continue
+
+                pending = list(rows_to_process)
+                opened = []  # currently processing items
+                available_pages = []  # pages that can be reused
+
+                while pending or opened:
+                    if self.stop_requested:
+                        self.status_signal.emit("Stop requested. Cleaning up...")
+                        overall_stop = True
+                        break
+
+                    # Open new tabs or reuse existing up to batch_size
+                    while pending and len(opened) < batch_size:
+                        item = pending.pop(0)
+
+                        # Reuse page if available, otherwise create a new one. Keep region fixed.
+                        if available_pages:
+                            page, last_successful_domain = available_pages.pop()
+                            current_domain = last_successful_domain
+                            try: page.evaluate("document.body.innerHTML = '';")
                             except: pass
-                            continue
+                        else:
+                            page = self.controller.context.new_page()
+                            current_domain = self.domain
 
-                    if stage == "navigating":
-                        safe_asin = urllib.parse.quote(str(entry['asin']))
-                        url = f"https://{entry['current_domain']}/dp/{safe_asin}/?_encoding=undefined&th=1&psc=1"
-                        self.status_signal.emit(f"Navigating Tab for Row {entry['row_idx']}: ASIN={entry['asin']} on {entry['current_domain']}")
-                        try: 
-                            page.evaluate(f"window.location.href = '{url}';")
-                        except: pass
-                        entry["stage"] = "waiting_images_link"
-                        entry["start_t"] = time.time()
-                        continue
+                        opened.append({
+                            "page": page,
+                            "row_idx": item['row_idx'],
+                            "sku": item['sku'],
+                            "asin": item['asin'],
+                            "current_domain": current_domain,
+                            "stage": "navigating",
+                            "next_action_time": 0,
+                            "start_t": 0,
+                            "row_start_t": time.time(),
+                            "reload1_done": False,
+                            "reload2_done": False
+                        })
 
-                    if stage == "resetting_tab":
-                        self.status_signal.emit(f"Resetting Tab for Row {entry['row_idx']}")
+                    tab_was_freed = False
+                    current_time = time.time()
+
+                    for entry in list(opened):
+                        page = entry["page"]
+
+                        # 1. Check if user manually closed it
                         try:
-                            # Clear tab content and wait for it to be ready
-                            page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
-                            # Update user on status
-                            page.evaluate("document.body.innerHTML = '<h2>Tab cleared. Waiting 2s...</h2>';")
-                        except Exception as e:
-                            # Log error if tab reset fails, but continue
-                            print(f"Could not reset tab for row {entry['row_idx']}: {e}")
-                        
-                        # Set up delay for the next action
-                        entry["stage"] = "delaying_next_row"
-                        entry["next_action_time"] = time.time() + 2.0
-                        continue
-
-                    if stage == "delaying_next_row":
-                        if current_time >= entry["next_action_time"]:
-                            # Save the successful domain with the page so the next row can inherit it
-                            available_pages.append((page, entry["current_domain"]))
-                            if entry in opened:
-                                opened.remove(entry)
-                                tab_was_freed = True
-                        continue
-
-                    if stage == "waiting_images_link":
-                        # Implement reloads at 10s and 20s, final skip at 30s.
-                        elapsed = current_time - entry.get("start_t", current_time)
-
-                        # Final timeout: skip row after 30s
-                        if elapsed >= 30:
-                            self.status_signal.emit(f"Row {entry['row_idx']} (ASIN={entry['asin']}) exceeded 30s. Skipping.")
+                            if page.is_closed():
+                                if entry in opened:
+                                    opened.remove(entry)
+                                    tab_was_freed = True
+                                continue
+                        except Exception:
                             if entry in opened:
                                 try: opened.remove(entry)
                                 except: pass
                                 tab_was_freed = True
-                            available_pages.append((page, entry["current_domain"]))
-                            try: page.evaluate("document.body.innerHTML = '<h2>Skipped - took more than 30s!</h2>';")
-                            except: pass
                             continue
 
-                        # Second reload at 20s
-                        if elapsed >= 20 and not entry.get("reload2_done"):
+                        stage = entry.get("stage")
+
+                        if stage != "delaying_next_row":
+                            if current_time - entry.get("row_start_t", current_time) > 30:
+                                self.status_signal.emit(f"Row {entry['row_idx']} (ASIN={entry['asin']}) exceeded 30s. Skipping.")
+                                if entry in opened:
+                                    try: opened.remove(entry)
+                                    except: pass
+                                    tab_was_freed = True
+                                available_pages.append((page, entry["current_domain"]))
+                                try: page.evaluate("document.body.innerHTML = '<h2>Skipped - took more than 30s!</h2>';")
+                                except: pass
+                                continue
+
+                        if stage == "navigating":
+                            safe_asin = urllib.parse.quote(str(entry['asin']))
+                            # Build sellercentral host from the current_domain (e.g. www.amazon.com -> sellercentral.amazon.com)
+                            def make_seller_host(domain):
+                                try:
+                                    # remove leading www.
+                                    d = domain.replace('www.', '')
+                                    if d.startswith('amazon.'):
+                                        return f"sellercentral.{d}"
+                                    # fallback: try to find amazon.* and build sellercentral.amazon.*
+                                    idx = d.find('amazon.')
+                                    if idx != -1:
+                                        return f"sellercentral.{d[idx:]}"
+                                    return f"sellercentral.{d}"
+                                except:
+                                    return f"sellercentral.{domain}"
+
+                            seller_host = make_seller_host(entry['current_domain'])
+                            url = (f"https://{seller_host}/myinventory/inventory?fulfilledBy=all&page=1&pageSize=25"
+                                   f"&searchField=all&searchTerm={safe_asin}&sort=date_created_desc&status=all")
+                            self.status_signal.emit(f"Navigating Tab for Row {entry['row_idx']}: ASIN={entry['asin']} on {seller_host}")
                             try:
-                                page.evaluate("window.location.reload();")
+                                page.evaluate(f"window.location.href = '{url}';")
                             except: pass
-                            entry["reload2_done"] = True
-                            self.status_signal.emit(f"Reloading (2) Tab for Row {entry['row_idx']}: ASIN={entry['asin']}")
+                            entry["stage"] = "waiting_images_link"
+                            entry["start_t"] = time.time()
                             continue
 
-                        # First reload at 10s — but first check for page-not-found phrases and skip immediately if found
-                        if elapsed >= 10 and not entry.get("reload1_done"):
+                        if stage == "resetting_tab":
+                            self.status_signal.emit(f"Resetting Tab for Row {entry['row_idx']}")
                             try:
-                                not_found_check = page.evaluate("""() => {
-                                    const title = document.title ? document.title.toLowerCase() : '';
-                                    const bodyText = document.body ? document.body.innerText.toLowerCase() : '';
-                                    const notFoundPhrases = [
-                                        'page not found', 'documento no encontrado', 'não foi possível encontrar esta página',
-                                        'page introuvable', 'página no encontrada', 'pagina no encontrada',
-                                        'impossibile trovare la pagina', 'seite nicht gefunden',
-                                        'página não encontrada', 'pagina não encontrada', 'ページが見つかりません'
-                                    ];
-                                    if (notFoundPhrases.some(phrase => title.includes(phrase))) return true;
-                                    if (bodyText.includes('not a functioning page on our site')) return true;
-                                    return false;
-                                }""")
-                            except:
-                                not_found_check = False
+                                # Clear tab content and wait for it to be ready
+                                page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+                                # Update user on status
+                                page.evaluate("document.body.innerHTML = '<h2>Tab cleared. Waiting 2s...</h2>';")
+                            except Exception as e:
+                                # Log error if tab reset fails, but continue
+                                print(f"Could not reset tab for row {entry['row_idx']}: {e}")
 
-                            if not_found_check:
-                                # Skip immediately if page clearly reports not found
-                                self.status_signal.emit(f"Row {entry['row_idx']} (ASIN={entry['asin']}) reported Page Not Found. Skipping.")
+                            # Set up delay for the next action
+                            entry["stage"] = "delaying_next_row"
+                            entry["next_action_time"] = time.time() + 2.0
+                            continue
+
+                        if stage == "delaying_next_row":
+                            if current_time >= entry["next_action_time"]:
+                                # Save the successful domain with the page so the next row can inherit it
+                                available_pages.append((page, entry["current_domain"]))
+                                if entry in opened:
+                                    opened.remove(entry)
+                                    tab_was_freed = True
+                            continue
+
+                        if stage == "waiting_images_link":
+                            # Implement reloads at 10s and 20s, final skip at 30s.
+                            elapsed = current_time - entry.get("start_t", current_time)
+
+                            # Final timeout: skip row after 30s
+                            if elapsed >= 30:
+                                self.status_signal.emit(f"Row {entry['row_idx']} (ASIN={entry['asin']}) exceeded 30s. Skipping.")
+                                if entry in opened:
+                                    try: opened.remove(entry)
+                                    except: pass
+                                    tab_was_freed = True
+                                available_pages.append((page, entry["current_domain"]))
+                                try: page.evaluate("document.body.innerHTML = '<h2>Skipped - took more than 30s!</h2>';")
+                                except: pass
+                                continue
+
+                            # Second reload at 20s
+                            if elapsed >= 20 and not entry.get("reload2_done"):
+                                try:
+                                    page.evaluate("window.location.reload();")
+                                except: pass
+                                entry["reload2_done"] = True
+                                self.status_signal.emit(f"Reloading (2) Tab for Row {entry['row_idx']}: ASIN={entry['asin']}")
+                                continue
+
+                            # First reload at 10s — but first check for page-not-found phrases and skip immediately if found
+                            if elapsed >= 10 and not entry.get("reload1_done"):
+                                try:
+                                    not_found_check = page.evaluate("""() => {
+                                        const title = document.title ? document.title.toLowerCase() : '';
+                                        const bodyText = document.body ? document.body.innerText.toLowerCase() : '';
+                                        const notFoundPhrases = [
+                                            'page not found', 'documento no encontrado', 'não foi possível encontrar esta página',
+                                            'page introuvable', 'página no encontrada', 'pagina no encontrada',
+                                            'impossibile trovare la pagina', 'seite nicht gefunden',
+                                            'página não encontrada', 'pagina não encontrada', 'ページが見つかりません'
+                                        ];
+                                        if (notFoundPhrases.some(phrase => title.includes(phrase))) return true;
+                                        if (bodyText.includes('not a functioning page on our site')) return true;
+                                        return false;
+                                    }""")
+                                except:
+                                    not_found_check = False
+
+                                if not_found_check:
+                                    # Skip immediately if page clearly reports not found
+                                    self.status_signal.emit(f"Row {entry['row_idx']} (ASIN={entry['asin']}) reported Page Not Found. Skipping.")
+                                    if entry in opened:
+                                        try: opened.remove(entry)
+                                        except: pass
+                                        tab_was_freed = True
+                                    available_pages.append((page, entry["current_domain"]))
+                                    try: page.evaluate("document.body.innerHTML = '<h2>Not Found - Skipping</h2>';")
+                                    except: pass
+                                    continue
+
+                                try:
+                                    page.evaluate("window.location.reload();")
+                                except: pass
+                                entry["reload1_done"] = True
+                                self.status_signal.emit(f"Reloading (1) Tab for Row {entry['row_idx']}: ASIN={entry['asin']}")
+                                continue
+
+                            # For sellercentral flow: try to locate the image using SKU-based xpath
+                            result = {"not_found": False, "image_src": None}
+                            try:
+                                sku_val = entry.get('sku')
+                                xpath = f'//*[@id="{sku_val}"]/div/div[4]/div/img'
+                                # Try to find element and get src attribute
+                                try:
+                                    locator = page.locator(f"xpath={xpath}").first
+                                    src = locator.get_attribute('src')
+                                except Exception:
+                                    src = None
+
+                                if src and isinstance(src, str) and src.startswith('http') and 'data:image' not in src:
+                                    result['image_src'] = src
+                                else:
+                                    result['image_src'] = None
+                            except Exception:
+                                pass
+
+                            if result.get("not_found"):
+                                # If page reports not found, skip row immediately
+                                self.status_signal.emit(f"Row {entry['row_idx']} (ASIN={entry['asin']}) reported Not Found. Skipping.")
                                 if entry in opened:
                                     try: opened.remove(entry)
                                     except: pass
@@ -685,112 +795,64 @@ class ExcelProcessThread(QThread):
                                 except: pass
                                 continue
 
-                            try:
-                                page.evaluate("window.location.reload();")
-                            except: pass
-                            entry["reload1_done"] = True
-                            self.status_signal.emit(f"Reloading (1) Tab for Row {entry['row_idx']}: ASIN={entry['asin']}")
-                            continue
-
-                        # Combined check for page not found OR image xpath to reduce IPC overhead
-                        result = {"not_found": False, "image_src": None}
-                        try:
-                            result = page.evaluate(f"""() => {{
-                                let not_found = false;
-                                let image_src = null;
+                            if result.get("image_src"):
+                                src = result["image_src"]
                                 
-                                // Check for not found
-                                if (window.location.href.includes('{entry['asin']}')) {{
-                                    if (document.getElementById('d') !== null) {{
-                                        not_found = true;
-                                    }} else {{
-                                        const title = document.title ? document.title.toLowerCase() : '';
-                                        const notFoundPhrases = [
-                                            'page not found', 'documento no encontrado', 'não foi possível encontrar esta página',
-                                            'page introuvable', 'página no encontrada', 'pagina no encontrada',
-                                            'impossibile trovare la pagina', 'seite nicht gefunden',
-                                            'página não encontrada', 'pagina não encontrada', 'ページが見つかりません'
-                                        ];
-                                        if (notFoundPhrases.some(phrase => title.includes(phrase))) {{
-                                            not_found = true;
-                                        }} else {{
-                                            const bodyText = document.body ? document.body.innerText.toLowerCase() : '';
-                                            if (bodyText.includes('not a functioning page on our site')) {{
-                                                not_found = true;
-                                            }}
-                                        }}
-                                    }}
-                                }}
+                                # Extract and save
+                                try:
+                                    import re
+                                    img_base = src.split('?', 1)[0]
+                                    m = re.match(r'(?P<prefix>.+?)\._[^.]+(?P<ext>\.[a-zA-Z0-9]{2,5})$', img_base)
+                                    cleaned_url = m.group('prefix') + m.group('ext') if m else img_base
+                                except Exception:
+                                    cleaned_url = src
+
+                                self.status_signal.emit(f"Found Image URL for ASIN={entry['asin']}")
+
+                                # Save directly using win32com to avoid overwriting user edits
+                                try:
+                                    sheet.Cells(entry["row_idx"], 6).Value = cleaned_url
+                                    sheet.Cells(entry["row_idx"], 15).Value = "Yes"
+                                except Exception as e:
+                                    self.status_signal.emit(f"Warning: Failed to update sheet - {e}")
                                 
-                                // Check for image
-                                if (!not_found) {{
-                                    const img = document.querySelector("#landingImage");
-                                    if (img) {{
-                                        const s = img.getAttribute("src");
-                                        if (s && s.includes("http") && !s.includes("data:image")) {{
-                                            image_src = s;
-                                        }}
-                                    }}
-                                }}
-                                
-                                return {{ not_found: not_found, image_src: image_src }};
-                            }}""")
-                        except: pass
+                                entry["stage"] = "resetting_tab"
+                                continue
 
-                        if result.get("not_found"):
-                            # If page reports not found, skip row immediately
-                            self.status_signal.emit(f"Row {entry['row_idx']} (ASIN={entry['asin']}) reported Not Found. Skipping.")
-                            if entry in opened:
-                                try: opened.remove(entry)
-                                except: pass
-                                tab_was_freed = True
-                            available_pages.append((page, entry["current_domain"]))
-                            try: page.evaluate("document.body.innerHTML = '<h2>Not Found - Skipping</h2>';")
-                            except: pass
-                            continue
+                    if tab_was_freed and len(opened) < batch_size and pending:
+                        continue
 
-                        if result.get("image_src"):
-                            src = result["image_src"]
-                            
-                            # Extract and save
-                            try:
-                                import re
-                                img_base = src.split('?', 1)[0]
-                                m = re.match(r'(?P<prefix>.+?)\._[^.]+(?P<ext>\.[a-zA-Z0-9]{2,5})$', img_base)
-                                cleaned_url = m.group('prefix') + m.group('ext') if m else img_base
-                            except Exception:
-                                cleaned_url = src
+                    time.sleep(0.05)
 
-                            self.status_signal.emit(f"Found Image URL for ASIN={entry['asin']}")
+                # Close all available pages for this chunk
+                for page_tuple in available_pages:
+                    try: 
+                        if isinstance(page_tuple, tuple):
+                            page_tuple[0].close()
+                        else:
+                            page_tuple.close()
+                    except: pass
 
-                            # Save directly using win32com to avoid overwriting user edits
-                            try:
-                                sheet.Cells(entry["row_idx"], 6).Value = cleaned_url
-                                sheet.Cells(entry["row_idx"], 15).Value = "Yes"
-                            except Exception as e:
-                                self.status_signal.emit(f"Warning: Failed to update sheet - {e}")
-                            
-                            entry["stage"] = "resetting_tab"
-                            continue
+                # Move to next chunk
+                if overall_stop or self.stop_requested:
+                    break
+                current_row = end_row + 1
+                try:
+                    max_row = sheet.UsedRange.Rows.Count
+                except Exception:
+                    pass
 
-                if tab_was_freed and len(opened) < batch_size and pending:
-                    continue
-
-                time.sleep(0.05)
-
-            # Close all available pages at the end
-            for page_tuple in available_pages:
-                try: 
-                    # Handle both tuples (if populated) and raw pages (just in case)
-                    if isinstance(page_tuple, tuple):
-                        page_tuple[0].close()
-                    else:
-                        page_tuple.close()
-                except: pass
-                    
-            self.controller.disconnect()
-            self.status_signal.emit("Finished processing Excel file.")
-            self.finished_signal.emit(True)
+            # After processing all chunks (or stop requested)
+            try:
+                self.controller.disconnect()
+            except:
+                pass
+            if self.stop_requested or overall_stop:
+                self.status_signal.emit("Stopped before completing all rows.")
+                self.finished_signal.emit(False)
+            else:
+                self.status_signal.emit("Finished processing Excel file.")
+                self.finished_signal.emit(True)
             
         except ImportError:
             self.notification_signal.emit("Dependency Error", "Please install pywin32 (pip install pywin32) to read Excel files.")
@@ -824,6 +886,10 @@ class ExcelProcessThread(QThread):
                 except: pass
 
             self.status_signal.emit("Finished cleanup.")
+
+    def set_user_logged_in(self):
+        """Called by the main UI when the user confirms they have logged into Seller Central."""
+        self.user_logged_in = True
 
 
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
@@ -1020,7 +1086,9 @@ class MainWindow(QMainWindow):
         except: pass
         self.stop_btn.clicked.connect(self.on_stop)
 
-        self.thread = ChromeLaunchThread(self.controller)
+        # Pass selected region domain so Chrome can open the corresponding Seller Central on launch
+        region = self.regions.get(self.region_combo.currentText())
+        self.thread = ChromeLaunchThread(self.controller, region_domain=region)
         self.thread.status_signal.connect(self.update_status)
         self.thread.notification_signal.connect(self.show_notification)
         self.thread.finished_signal.connect(self.on_launch_finished)
@@ -1041,6 +1109,8 @@ class MainWindow(QMainWindow):
                 self.process_thread.status_signal.connect(self.update_status)
                 self.process_thread.notification_signal.connect(self.show_notification)
                 self.process_thread.retry_save_signal.connect(self.show_save_error_dialog, type=Qt.BlockingQueuedConnection)
+                # Connect login request signal to show a blocking login dialog in the UI
+                self.process_thread.login_request_signal.connect(self.show_login_dialog, type=Qt.BlockingQueuedConnection)
                 self.process_thread.finished_signal.connect(self.on_process_finished)
                 self.process_thread.start()
             else:
@@ -1064,6 +1134,22 @@ class MainWindow(QMainWindow):
         msg.setText("The Excel sheet is currently open.\nPlease close the file in Excel and click OK to continue.")
         msg.setStandardButtons(QMessageBox.Ok)
         msg.exec()
+
+    def show_login_dialog(self, title, message):
+        msg = QMessageBox(self)
+        msg.setWindowFlags(msg.windowFlags() | Qt.WindowStaysOnTopHint)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle(title)
+        msg.setText(message)
+        msg.setStandardButtons(QMessageBox.Ok)
+        res = msg.exec()
+        if res == QMessageBox.Ok:
+            try:
+                # Inform the worker thread that the user confirmed login
+                if hasattr(self, 'process_thread'):
+                    self.process_thread.set_user_logged_in()
+            except Exception:
+                pass
 
     def on_process_finished(self, success):
         if hasattr(self, "process_thread"):
