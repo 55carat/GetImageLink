@@ -3,3 +3,6 @@ pyautogui
 pyperclip
 pywin32
 PySide6
+greenlet 
+setuptools 
+wheel
